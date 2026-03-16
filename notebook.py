@@ -421,6 +421,20 @@ inference_server = kaggle_evaluation.aimo_3_inference_server.AIMO3InferenceServe
 if os.getenv('KAGGLE_IS_COMPETITION_RERUN'):
     inference_server.serve()
 else:
-    inference_server.run_local_gateway(
-        ('/kaggle/input/ai-mathematical-olympiad-progress-prize-3/test.csv',)
-    )
+    # In regular (non-competition) mode, test.csv may not exist.
+    # Try local gateway with test data, fall back to a dummy run.
+    test_path = '/kaggle/input/ai-mathematical-olympiad-progress-prize-3/test.csv'
+    if os.path.exists(test_path):
+        inference_server.run_local_gateway((test_path,))
+    else:
+        print("="*60)
+        print("TranscendPlexity AIMO3 — Ready for Competition Submission")
+        print("="*60)
+        print("No test.csv found (normal for non-competition runs).")
+        print("This notebook is configured for competition rerun via serve().")
+        print("To submit: Save this version → Submit to Competition.")
+        print()
+        # Create a dummy submission so Kaggle sees output
+        dummy = pl.DataFrame({'id': ['dummy'], 'answer': [0]})
+        dummy.write_parquet('submission.parquet')
+        print("Created dummy submission.parquet for validation.")
