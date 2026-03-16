@@ -47,7 +47,13 @@ MODEL_PATHS = [
     "/kaggle/input/gpt-oss-120b",
     "/kaggle/input/gpt-oss/transformers/120b/1",
     "/kaggle/input/gpt-oss/gpt-oss-120b",
-    "openai/gpt-oss-120b",
+    "/kaggle/input/gpt-oss/PyTorch/120b/1",
+]
+# Fallback models if gpt-oss isn't attached
+FALLBACK_MODELS = [
+    "/kaggle/input/deepseek-r1-distill-qwen-32b",
+    "/kaggle/input/qwen2.5-math-72b-instruct",
+    "Qwen/Qwen2.5-Math-72B-Instruct",
 ]
 
 NUM_ATTEMPTS = 8           # Voting attempts per problem
@@ -239,17 +245,17 @@ class VLLMSolver:
     def load(self):
         from vllm import LLM, SamplingParams
 
-        # Find model path
+        # Find model path — try primary paths, then fallbacks
         model_path = None
-        for p in MODEL_PATHS:
+        for p in MODEL_PATHS + FALLBACK_MODELS:
             if os.path.exists(p):
                 model_path = p
                 print(f"Found model at: {p}")
                 break
 
         if model_path is None:
-            model_path = MODEL_PATHS[-1]  # Fall back to HF name
-            print(f"Using HuggingFace model name: {model_path}")
+            model_path = "openai/gpt-oss-120b"  # Fall back to HF name
+            print(f"No local model found. Using HuggingFace: {model_path}")
 
         print(f"Loading model via vLLM...")
         self.llm = LLM(
@@ -265,16 +271,29 @@ class VLLMSolver:
         print(f"Model loaded in {time.time() - self.start_time:.1f}s!")
 
     def generate(self, system: str, user: str, temperature: float = 0.7) -> str:
-        """Generate completion via vLLM."""
+        """Generate completion via vLLM using model's native chat template."""
         params = self.SamplingParams(
             temperature=temperature,
             max_tokens=MAX_TOKENS,
             top_p=0.95,
         )
-        # Build chat prompt
-        prompt = f"<|system|>\n{system}\n<|user|>\n{user}\n<|assistant|>\n"
-        outputs = self.llm.generate([prompt], params)
-        return outputs[0].outputs[0].text
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ]
+        # Use vLLM's chat() which auto-applies the model's chat template
+        # (Harmony format for gpt-oss-120b, ChatML for Qwen, etc.)
+        try:
+            outputs = self.llm.chat(messages=[messages], sampling_params=params)
+            return outputs[0].outputs[0].text
+        except (AttributeError, TypeError):
+            # Fallback: apply template manually via tokenizer
+            tokenizer = self.llm.get_tokenizer()
+            prompt = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+            outputs = self.llm.generate([prompt], params)
+            return outputs[0].outputs[0].text
 
     def solve_single(self, problem: str, temperature: float = 0.7) -> Optional[int]:
         """Single TIR attempt: generate code → execute → extract answer."""
