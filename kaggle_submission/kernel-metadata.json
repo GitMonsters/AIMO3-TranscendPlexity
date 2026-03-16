@@ -1,0 +1,16 @@
+{
+    "id": "evanpieser/transcendplexity-aimo3",
+    "title": "TranscendPlexity AIMO3",
+    "code_file": "notebook.py",
+    "language": "python",
+    "kernel_type": "script",
+    "is_private": true,
+    "enable_gpu": true,
+    "enable_internet": false,
+    "competition": "ai-mathematical-olympiad-progress-prize-3",
+    "dataset_sources": [],
+    "competition_sources": ["ai-mathematical-olympiad-progress-prize-3"],
+    "model_sources": ["openai/gpt-oss/transformers/120b/1"],
+    "kernel_sources": [],
+    "keywords": ["math"]
+}

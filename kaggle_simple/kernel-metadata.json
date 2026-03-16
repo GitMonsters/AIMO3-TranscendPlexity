@@ -1,0 +1,16 @@
+{
+    "id": "evanpieser/transcendplexity-aimo3-lite",
+    "title": "TranscendPlexity AIMO3 Lite",
+    "code_file": "notebook_simple.py",
+    "language": "python",
+    "kernel_type": "script",
+    "is_private": true,
+    "enable_gpu": false,
+    "enable_internet": false,
+    "competition": "ai-mathematical-olympiad-progress-prize-3",
+    "dataset_sources": [],
+    "competition_sources": ["ai-mathematical-olympiad-progress-prize-3"],
+    "model_sources": ["deepseek-ai/deepseek-r1-distill-qwen-32b/transformers/default/1"],
+    "kernel_sources": [],
+    "keywords": ["math"]
+}
