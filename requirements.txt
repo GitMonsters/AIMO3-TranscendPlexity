@@ -1,0 +1,11 @@
+# AIMO3 - TranscendPlexity
+# AI Mathematical Olympiad Progress Prize 3
+
+openai>=1.0.0
+vllm>=0.6.0
+sympy>=1.12
+numpy>=1.24
+pandas>=2.0
+torch>=2.0
+transformers>=4.40
+tqdm
