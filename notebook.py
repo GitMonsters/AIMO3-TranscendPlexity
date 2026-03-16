@@ -3,16 +3,22 @@
 TranscendPlexity AIMO3 — Kaggle Notebook Submission
 AI Mathematical Olympiad Progress Prize 3 ($2.2M)
 
-This notebook runs on Kaggle H100 GPU with internet OFF.
-It loads gpt-oss-120b via vLLM and solves 110 olympiad math problems
-using Tool-Integrated Reasoning (code generation + execution + majority voting).
+SUBMISSION FORMAT: Kaggle inference server (not batch CSV).
+Uses kaggle_evaluation.aimo_3_inference_server.AIMO3InferenceServer.
+
+Pipeline: Problem → vLLM generates Python code → sandbox executes → extract integer
+          Repeat N times → majority vote → return answer
+
+Model: gpt-oss-120b via vLLM (MXFP4 quantization, fits single H100 80GB)
 
 Usage on Kaggle:
-  1. Upload this as a Kaggle notebook
-  2. Attach gpt-oss-120b model as a Kaggle dataset input
-  3. Set Accelerator: GPU H100
-  4. Set Internet: OFF
-  5. Run All → Submit
+  1. File > Editor Type > Script
+  2. Paste this entire file
+  3. File > Editor Type > Notebook
+  4. Add Model: openai/gpt-oss-120b as Kaggle Model input
+  5. Session options > Accelerator > GPU H100
+  6. Internet: OFF
+  7. Save & Run All → Submit output
 
 Author: Evan Pieser / TranscendPlexity
 """
@@ -21,53 +27,42 @@ Author: Evan Pieser / TranscendPlexity
 # CONFIGURATION
 # ===========================================================================
 
-MODEL_PATH = "/kaggle/input/gpt-oss-120b"  # Kaggle dataset path
-MODEL_NAME = "openai/gpt-oss-120b"
-NUM_ATTEMPTS = 8           # Voting attempts per problem
-CODE_TIMEOUT = 60          # Seconds per code execution
-TIME_BUDGET = 16200        # 4.5 hours total (buffer for 5hr limit)
-MAX_TOKENS = 4096
-VLLM_GPU_MEMORY = 0.92    # Use 92% of H100 80GB
-VLLM_MAX_MODEL_LEN = 8192
-
-# ===========================================================================
-# INSTALL DEPENDENCIES (cached in Kaggle dataset if needed)
-# ===========================================================================
-
-import subprocess
-import sys
-
-def install_if_needed(package: str, import_name: str = None):
-    try:
-        __import__(import_name or package)
-    except ImportError:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", package])
-
-install_if_needed("vllm")
-install_if_needed("sympy")
-install_if_needed("openai")
-
-# ===========================================================================
-# IMPORTS
-# ===========================================================================
-
 import os
 import re
-import json
+import io
+import sys
 import time
 import math
-import io
+import json
+import traceback
 import multiprocessing
 from collections import Counter
 from typing import Optional
+
 import pandas as pd
+import polars as pl
+
+# Model config — adjust path based on how you attach the model on Kaggle
+MODEL_PATHS = [
+    "/kaggle/input/gpt-oss-120b",
+    "/kaggle/input/gpt-oss/transformers/120b/1",
+    "/kaggle/input/gpt-oss/gpt-oss-120b",
+    "openai/gpt-oss-120b",
+]
+
+NUM_ATTEMPTS = 8           # Voting attempts per problem
+CODE_TIMEOUT = 45          # Seconds per code execution
+MAX_TOKENS = 4096
+VLLM_GPU_MEMORY = 0.90    # Use 90% of H100 80GB
+VLLM_MAX_MODEL_LEN = 8192
+TOTAL_TIME_BUDGET = 16200  # 4.5 hours (buffer for 5hr limit)
 
 # ===========================================================================
-# SANDBOX — Safe code execution
+# SANDBOX — Safe Python code execution in subprocess
 # ===========================================================================
 
-def _execute_worker(code: str, result_queue, timeout: int):
-    """Execute code in subprocess."""
+def _sandbox_worker(code: str, result_queue, timeout: int):
+    """Execute code in isolated subprocess."""
     try:
         stdout_buf = io.StringIO()
         local_ns = {}
@@ -79,24 +74,46 @@ def _execute_worker(code: str, result_queue, timeout: int):
             sys.stdout = old_stdout
 
         stdout_text = stdout_buf.getvalue()
-        answer = local_ns.get("answer") or local_ns.get("result") or local_ns.get("ans")
 
+        # Extract answer from multiple sources
+        answer = None
+        for var in ["answer", "result", "ans", "ANSWER", "Answer"]:
+            if var in local_ns:
+                answer = local_ns[var]
+                break
+
+        # Fallback: last printed number
         if answer is None and stdout_text.strip():
-            last = stdout_text.strip().split("\n")[-1].strip()
-            try:
-                answer = int(float(last))
-            except (ValueError, TypeError):
-                pass
+            lines = stdout_text.strip().split("\n")
+            for line in reversed(lines):
+                nums = re.findall(r'-?\d+', line.strip())
+                if nums:
+                    try:
+                        answer = int(nums[-1])
+                    except (ValueError, OverflowError):
+                        pass
+                    break
 
-        result_queue.put({"success": True, "answer": answer, "stdout": stdout_text[:5000], "error": None})
+        result_queue.put({
+            "success": True,
+            "answer": answer,
+            "stdout": stdout_text[:5000],
+            "error": None
+        })
     except Exception as e:
-        result_queue.put({"success": False, "answer": None, "stdout": "", "error": f"{type(e).__name__}: {str(e)[:500]}"})
+        result_queue.put({
+            "success": False,
+            "answer": None,
+            "stdout": "",
+            "error": f"{type(e).__name__}: {str(e)[:500]}"
+        })
 
 
-def execute_code(code: str, timeout: int = 60) -> dict:
+def execute_code(code: str, timeout: int = CODE_TIMEOUT) -> dict:
+    """Run code in sandboxed subprocess with hard timeout."""
     ctx = multiprocessing.get_context("fork")
     q = ctx.Queue()
-    proc = ctx.Process(target=_execute_worker, args=(code, q, timeout))
+    proc = ctx.Process(target=_sandbox_worker, args=(code, q, timeout))
     proc.start()
     proc.join(timeout=timeout)
     if proc.is_alive():
@@ -108,70 +125,73 @@ def execute_code(code: str, timeout: int = 60) -> dict:
         return {"success": False, "answer": None, "stdout": "", "error": f"Timeout ({timeout}s)"}
     try:
         return q.get_nowait()
-    except:
+    except Exception:
         return {"success": False, "answer": None, "stdout": "", "error": "No result"}
 
 
-def extract_integer(raw) -> Optional[int]:
+def to_int(raw) -> Optional[int]:
+    """Convert raw answer to integer in AIMO range [0, 99999]."""
     if raw is None:
         return None
     try:
-        val = int(float(str(raw).strip())) if not isinstance(raw, (int, float)) else int(raw)
+        if isinstance(raw, (int, float)):
+            val = int(raw)
+        else:
+            s = str(raw).strip()
+            # Handle sympy objects
+            val = int(float(s))
         return val % 100000
-    except:
+    except (ValueError, TypeError, OverflowError):
         return None
 
+
 # ===========================================================================
-# PROMPTS
+# PROMPTS — Math olympiad code generation
 # ===========================================================================
 
-SYSTEM = """You are an expert mathematical olympiad solver. Solve problems by writing Python code.
+SYSTEM_PROMPT = """You are an expert mathematical olympiad solver. You MUST solve problems by writing Python code.
 
 RULES:
-1. ALWAYS write Python code — do NOT just reason verbally.
-2. Use sympy for symbolic math, algebra, equation solving.
-3. Use itertools/math for combinatorics and number theory.
-4. Store your final answer in a variable called `answer`.
+1. ALWAYS write executable Python code in a ```python block.
+2. Use sympy for symbolic math, algebra, equations, number theory.
+3. Use itertools/math for combinatorics.
+4. Store your FINAL integer answer in a variable called `answer`.
 5. The answer MUST be a non-negative integer (0 to 99999).
-6. If the problem says "find the remainder when X is divided by Y", compute X % Y.
+6. If the problem asks for a remainder mod N, compute result % N.
 7. Print intermediate results to verify your reasoning.
-8. Your code must be self-contained. No external files or network.
+8. Your code must be 100% self-contained. No external files or network.
+9. Import everything you need at the top of your code.
+10. ALWAYS end with: print(f"ANSWER: {answer}")
 """
 
-def make_prompt(problem: str) -> str:
+def make_solve_prompt(problem: str) -> str:
     return f"""Solve this math olympiad problem by writing Python code.
 
 PROBLEM:
 {problem}
 
-Write a complete, self-contained Python program that solves this step by step.
-Store the final integer answer in `answer`. Print the answer.
+Write complete, self-contained Python code that:
+1. Solves this step by step with clear comments
+2. Uses sympy for any algebraic/symbolic work
+3. Stores the final integer answer in `answer`
+4. Prints: ANSWER: {{answer}}
 
 ```python
 """
 
 def make_retry_prompt(error: str, code: str, stdout: str) -> str:
-    return f"""Your previous attempt had an error:
-{error}
+    return f"""Your previous code had an error. Fix it.
 
-Previous code:
+ERROR: {error}
+
+PREVIOUS CODE:
 ```python
 {code}
 ```
-Output: {stdout or '(none)'}
 
-Fix the code. Store integer answer in `answer`.
+OUTPUT SO FAR: {stdout or '(none)'}
 
-```python
-"""
-
-def make_verify_prompt(problem: str, answer: int) -> str:
-    return f"""Verify this answer using a DIFFERENT method.
-
-PROBLEM: {problem}
-CLAIMED ANSWER: {answer}
-
-If correct, set answer = {answer}. If wrong, set answer to your result.
+Write fixed Python code. Store integer answer in `answer`. Print ANSWER: {{answer}}.
 
 ```python
 """
@@ -181,24 +201,57 @@ If correct, set answer = {answer}. If wrong, set answer to your result.
 # ===========================================================================
 
 def extract_code(text: str) -> Optional[str]:
-    for pat in [r"```python\n(.*?)```", r"```\n(.*?)```", r"```python(.*?)```"]:
+    """Extract Python code from LLM response."""
+    for pat in [r"```python\n(.*?)```", r"```python(.*?)```", r"```\n(.*?)```"]:
         m = re.findall(pat, text, re.DOTALL)
         if m:
             return m[-1].strip()
-    if any(kw in text for kw in ["import ", "def ", "answer", "print("]):
+    # If response looks like raw code
+    if any(kw in text for kw in ["import ", "def ", "answer =", "answer=", "print("]):
         return text.strip()
     return None
 
+
+def extract_boxed(text: str) -> Optional[int]:
+    """Extract \\boxed{} answer as fallback (no-code reasoning)."""
+    matches = re.findall(r'\\boxed\{(\d+)\}', text)
+    if matches:
+        try:
+            return int(matches[-1]) % 100000
+        except ValueError:
+            pass
+    return None
+
+
 # ===========================================================================
-# LLM CLIENT — vLLM local on H100
+# LLM CLIENT — vLLM on Kaggle H100
 # ===========================================================================
 
-class VLLMClient:
-    """Local vLLM inference on Kaggle H100."""
+class VLLMSolver:
+    """vLLM-based solver for Kaggle H100."""
 
-    def __init__(self, model_path: str):
+    def __init__(self):
+        self.llm = None
+        self.sampling_params = None
+        self.start_time = time.time()
+        self.problems_solved = 0
+
+    def load(self):
         from vllm import LLM, SamplingParams
-        print(f"Loading model from {model_path}...")
+
+        # Find model path
+        model_path = None
+        for p in MODEL_PATHS:
+            if os.path.exists(p):
+                model_path = p
+                print(f"Found model at: {p}")
+                break
+
+        if model_path is None:
+            model_path = MODEL_PATHS[-1]  # Fall back to HF name
+            print(f"Using HuggingFace model name: {model_path}")
+
+        print(f"Loading model via vLLM...")
         self.llm = LLM(
             model=model_path,
             trust_remote_code=True,
@@ -206,175 +259,149 @@ class VLLMClient:
             max_model_len=VLLM_MAX_MODEL_LEN,
             quantization="mxfp4",
             dtype="auto",
+            enforce_eager=True,
         )
         self.SamplingParams = SamplingParams
-        print("Model loaded!")
+        print(f"Model loaded in {time.time() - self.start_time:.1f}s!")
 
-    def generate(self, system: str, user: str, temperature: float = 0.7, max_tokens: int = 4096) -> str:
-        params = self.SamplingParams(temperature=temperature, max_tokens=max_tokens)
+    def generate(self, system: str, user: str, temperature: float = 0.7) -> str:
+        """Generate completion via vLLM."""
+        params = self.SamplingParams(
+            temperature=temperature,
+            max_tokens=MAX_TOKENS,
+            top_p=0.95,
+        )
+        # Build chat prompt
         prompt = f"<|system|>\n{system}\n<|user|>\n{user}\n<|assistant|>\n"
         outputs = self.llm.generate([prompt], params)
         return outputs[0].outputs[0].text
 
+    def solve_single(self, problem: str, temperature: float = 0.7) -> Optional[int]:
+        """Single TIR attempt: generate code → execute → extract answer."""
+        try:
+            resp = self.generate(SYSTEM_PROMPT, make_solve_prompt(problem), temperature)
+            code = extract_code(resp)
 
-class OpenAIClient:
-    """OpenAI-compatible client for NVIDIA NIM or remote vLLM."""
+            if not code:
+                # Fallback: try to extract \boxed{} from pure reasoning
+                return extract_boxed(resp)
 
-    def __init__(self, base_url: str, api_key: str, model: str):
-        from openai import OpenAI
-        self.client = OpenAI(base_url=base_url, api_key=api_key)
-        self.model = model
+            result = execute_code(code, timeout=CODE_TIMEOUT)
 
-    def generate(self, system: str, user: str, temperature: float = 0.7, max_tokens: int = 4096) -> str:
-        resp = self.client.chat.completions.create(
-            model=self.model,
-            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-            temperature=temperature,
-            max_tokens=max_tokens,
-        )
-        return resp.choices[0].message.content
+            # Retry once on error
+            if not result["success"] or result["answer"] is None:
+                resp2 = self.generate(
+                    SYSTEM_PROMPT,
+                    make_retry_prompt(
+                        result.get("error", "No answer produced"),
+                        code,
+                        result.get("stdout", "")
+                    ),
+                    temperature
+                )
+                code2 = extract_code(resp2)
+                if code2:
+                    result = execute_code(code2, timeout=CODE_TIMEOUT)
+                elif not result["answer"]:
+                    return extract_boxed(resp2)
 
-# ===========================================================================
-# SOLVER
-# ===========================================================================
+            return to_int(result.get("answer"))
 
-def solve_single(client, problem: str, temperature: float = 0.7) -> Optional[int]:
-    """Single TIR attempt: prompt → code → execute → answer."""
-    try:
-        resp = client.generate(SYSTEM, make_prompt(problem), temperature=temperature)
-        code = extract_code(resp)
-        if not code:
+        except Exception as e:
+            print(f"    solve_single error: {e}")
             return None
 
-        result = execute_code(code, timeout=CODE_TIMEOUT)
-
-        # Retry on error
-        if not result["success"] or result["answer"] is None:
-            resp2 = client.generate(SYSTEM, make_retry_prompt(
-                result.get("error", "No answer"), code, result.get("stdout", "")
-            ), temperature=temperature)
-            code2 = extract_code(resp2)
-            if code2:
-                result = execute_code(code2, timeout=CODE_TIMEOUT)
-
-        return extract_integer(result.get("answer"))
-    except Exception as e:
-        print(f"  solve_single error: {e}")
-        return None
-
-
-def solve_with_voting(client, problem: str, num_attempts: int = 8) -> tuple[int, float]:
-    """Majority-vote solver. Returns (answer, confidence)."""
-    answers = []
-    for i in range(num_attempts):
-        temp = 0.6 + (i * 0.08)
-        ans = solve_single(client, problem, temperature=min(temp, 1.2))
-        if ans is not None:
-            answers.append(ans)
-
-    if not answers:
-        return 0, 0.0
-
-    counter = Counter(answers)
-    best, count = counter.most_common(1)[0]
-    conf = count / len(answers)
-
-    # Verify low-confidence answers
-    if conf < 0.6 and len(counter) > 1:
-        try:
-            resp = client.generate(SYSTEM, make_verify_prompt(problem, best), temperature=0.3)
-            code = extract_code(resp)
-            if code:
-                res = execute_code(code, timeout=CODE_TIMEOUT)
-                vans = extract_integer(res.get("answer"))
-                if vans is not None and vans in counter:
-                    best = vans
-                    conf = min(conf + 0.2, 1.0)
-        except:
-            pass
-
-    return best, conf
-
-# ===========================================================================
-# KAGGLE MODEL CLASS (required submission interface)
-# ===========================================================================
-
-class Model:
-    """AIMO3 Kaggle submission interface."""
-
-    def __init__(self):
-        # Try local vLLM first (Kaggle H100), fall back to remote
-        if os.path.exists(MODEL_PATH):
-            print("Using local vLLM on H100")
-            self.client = VLLMClient(MODEL_PATH)
-        elif os.getenv("LLM_BASE_URL"):
-            print("Using remote endpoint")
-            self.client = OpenAIClient(
-                os.getenv("LLM_BASE_URL"),
-                os.getenv("LLM_API_KEY", "none"),
-                os.getenv("LLM_MODEL", MODEL_NAME),
-            )
-        else:
-            raise RuntimeError("No model available! Set LLM_BASE_URL or attach model dataset.")
-
-        self.start_time = time.time()
-        self.problems_solved = 0
-
-    def query(self, problem_statement: str) -> int:
-        """Solve a single problem. Returns integer answer."""
-        self.problems_solved += 1
-        elapsed = time.time() - self.start_time
-        remaining = TIME_BUDGET - elapsed
-
-        # Adaptive attempts based on remaining time
-        est_problems_left = max(1, 110 - self.problems_solved + 1)
-        time_per_problem = remaining / est_problems_left
-        attempts = max(2, min(NUM_ATTEMPTS, int(time_per_problem / 25)))
-
-        print(f"\n{'='*60}")
-        print(f"Problem {self.problems_solved}/110 | {attempts} attempts | {remaining:.0f}s remaining")
-        print(f"{'='*60}")
-        print(f"{problem_statement[:200]}...")
-
-        answer, conf = solve_with_voting(self.client, problem_statement, num_attempts=attempts)
-
-        print(f"→ Answer: {answer} (confidence: {conf:.0%})")
-        return answer
-
-
-# ===========================================================================
-# MAIN — runs when notebook is executed
-# ===========================================================================
-
-if __name__ == "__main__":
-    import glob
-
-    # Check if we're on Kaggle
-    test_csv = "/kaggle/input/ai-mathematical-olympiad-progress-prize-3/test.csv"
-
-    if os.path.exists(test_csv):
-        # --- KAGGLE MODE ---
-        print("=" * 60)
-        print("TranscendPlexity AIMO3 — Kaggle Submission")
-        print("=" * 60)
-
-        df = pd.read_csv(test_csv)
-        model = Model()
+    def solve_with_voting(self, problem: str, num_attempts: int = NUM_ATTEMPTS) -> int:
+        """Majority-vote solver across multiple attempts."""
         answers = []
 
-        for _, row in df.iterrows():
-            ans = model.query(row["problem"])
-            answers.append({"id": row["id"], "answer": ans})
+        for i in range(num_attempts):
+            temp = 0.5 + (i * 0.1)  # Sweep 0.5 → 1.3
+            temp = min(temp, 1.3)
+            ans = self.solve_single(problem, temperature=temp)
+            if ans is not None:
+                answers.append(ans)
+                print(f"    Attempt {i+1}/{num_attempts}: {ans}")
+            else:
+                print(f"    Attempt {i+1}/{num_attempts}: FAILED")
 
-        result_df = pd.DataFrame(answers)
-        result_df.to_csv("submission.csv", index=False)
-        result_df.to_parquet("submission.parquet", index=False)
-        print(f"\nDone! {len(answers)} problems solved.")
-        print(result_df.head(10))
+        if not answers:
+            print("    All attempts failed, returning 0")
+            return 0
 
-    else:
-        # --- LOCAL TEST MODE ---
-        print("=" * 60)
-        print("TranscendPlexity AIMO3 — Local Test Mode")
-        print("=" * 60)
-        print("No Kaggle test.csv found. Run test_local.py for local testing.")
+        # Majority vote
+        counter = Counter(answers)
+        best, count = counter.most_common(1)[0]
+        confidence = count / len(answers)
+        print(f"    Vote: {best} ({confidence:.0%} confidence, {len(answers)} valid answers)")
+        print(f"    Distribution: {dict(counter)}")
+
+        return best
+
+
+# ===========================================================================
+# KAGGLE SUBMISSION — AIMO3InferenceServer interface
+# ===========================================================================
+
+solver = VLLMSolver()
+solve_start_time = time.time()
+problems_solved = 0
+
+
+def predict(id_: pl.Series, problem: pl.Series) -> pl.DataFrame | pd.DataFrame:
+    """
+    Kaggle competition predict function.
+    Called once per problem by AIMO3InferenceServer.
+    """
+    global problems_solved
+
+    # Lazy-load model on first call
+    if solver.llm is None:
+        solver.load()
+
+    problem_id = id_.item(0)
+    problem_text: str = problem.item(0)
+    problems_solved += 1
+
+    elapsed = time.time() - solve_start_time
+    remaining = TOTAL_TIME_BUDGET - elapsed
+
+    # Adaptive attempts based on time remaining
+    est_left = max(1, 110 - problems_solved + 1)
+    time_per = remaining / est_left
+    attempts = max(2, min(NUM_ATTEMPTS, int(time_per / 30)))
+
+    print(f"\n{'='*60}")
+    print(f"Problem {problems_solved}/110 | ID: {problem_id}")
+    print(f"Attempts: {attempts} | Time left: {remaining:.0f}s | Budget/prob: {time_per:.0f}s")
+    print(f"{'='*60}")
+    print(f"{problem_text[:300]}...")
+
+    try:
+        answer = solver.solve_with_voting(problem_text, num_attempts=attempts)
+    except Exception as e:
+        print(f"FATAL ERROR: {e}")
+        traceback.print_exc()
+        answer = 0
+
+    # Ensure valid range
+    answer = int(answer) % 100000
+
+    print(f"→ FINAL ANSWER: {answer}")
+    return pl.DataFrame({'id': problem_id, 'answer': answer})
+
+
+# ===========================================================================
+# MAIN — Kaggle inference server entry point
+# ===========================================================================
+
+import kaggle_evaluation.aimo_3_inference_server
+
+inference_server = kaggle_evaluation.aimo_3_inference_server.AIMO3InferenceServer(predict)
+
+if os.getenv('KAGGLE_IS_COMPETITION_RERUN'):
+    inference_server.serve()
+else:
+    inference_server.run_local_gateway(
+        ('/kaggle/input/ai-mathematical-olympiad-progress-prize-3/test.csv',)
+    )
